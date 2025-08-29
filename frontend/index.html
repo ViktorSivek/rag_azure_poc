@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>RAG PoC</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body {
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto,
+          Arial;
+        margin: 20px;
+        color: #111;
+      }
+      .box {
+        max-width: 900px;
+        margin: 0 auto;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+        margin-top: 12px;
+      }
+      textarea {
+        width: 100%;
+        height: 100px;
+        padding: 10px;
+        font-size: 15px;
+      }
+      input,
+      select,
+      button {
+        padding: 8px;
+        font-size: 14px;
+      }
+      button {
+        cursor: pointer;
+      }
+      .answer {
+        white-space: pre-wrap;
+        background: #f7f7f7;
+        padding: 12px;
+        border-radius: 6px;
+        margin-top: 10px;
+      }
+      .sources {
+        margin-top: 10px;
+        font-size: 14px;
+      }
+      .pill {
+        display: inline-block;
+        padding: 4px 8px;
+        background: #eef;
+        border-radius: 999px;
+        margin: 2px 4px 0 0;
+      }
+      .muted {
+        color: #666;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="box">
+      <h2>RAG PoC</h2>
+      <p class="muted">
+        Ask questions over your indexed PDFs. Answers include inline citations
+        [1], [2].
+      </p>
+      <textarea id="q" placeholder="Type your question..."></textarea>
+      <div class="row">
+        <label
+          >Doc filter:
+          <input
+            id="doc"
+            placeholder="Optional: exact source_document filename"
+            style="width: 280px"
+          />
+        </label>
+        <label
+          >k:
+          <input
+            id="topk"
+            type="number"
+            value="6"
+            min="1"
+            max="20"
+            style="width: 70px"
+          />
+        </label>
+        <label
+          >knn:
+          <input
+            id="knn"
+            type="number"
+            value="50"
+            min="1"
+            max="200"
+            style="width: 80px"
+          />
+        </label>
+        <label
+          >Hybrid:
+          <select id="hybrid">
+            <option value="true" selected>On</option>
+            <option value="false">Off (vector-only)</option>
+          </select>
+        </label>
+        <button id="ask">Ask</button>
+      </div>
+
+      <div id="out"></div>
+    </div>
+
+    <script>
+      const el = (id) => document.getElementById(id);
+
+      async function ask() {
+        const out = el("out");
+        out.innerHTML = '<p class="muted">Querying...</p>';
+        const body = {
+          question: el("q").value.trim(),
+          top_k: Number(el("topk").value) || 6,
+          knn: Number(el("knn").value) || 50,
+          hybrid: el("hybrid").value === "true",
+          doc: el("doc").value.trim() || null,
+        };
+        if (!body.question) {
+          out.innerHTML = '<p class="muted">Please enter a question.</p>';
+          return;
+        }
+        try {
+          const resp = await fetch("/ask", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.detail || "Request failed");
+          out.innerHTML = "";
+          const ans = document.createElement("div");
+          ans.className = "answer";
+          ans.textContent = data.answer || "(no answer)";
+          out.appendChild(ans);
+
+          const src = document.createElement("div");
+          src.className = "sources";
+          src.innerHTML =
+            "<b>Sources</b>: " +
+            (data.sources || [])
+              .map((s, i) => `<span class="pill">[${i + 1}] ${s.doc}</span>`)
+              .join(" ");
+          out.appendChild(src);
+        } catch (e) {
+          out.innerHTML = `<p style="color:#b00;">${e.message}</p>`;
+        }
+      }
+
+      el("ask").addEventListener("click", ask);
+      el("q").addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) ask();
+      });
+    </script>
+  </body>
+</html>

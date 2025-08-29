@@ -1,0 +1,14 @@
+.env
+*.env
+.git
+.gitignore
+README.md
+LICENSE
+scripts/
+data/
+notebooks/
+tests/
+__pycache__/
+*.pyc
+*.ipynb
+*.pdf
