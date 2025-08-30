@@ -45,6 +45,7 @@ class AskRequest(BaseModel):
 class AskResponse(BaseModel):
     answer: str
     sources: List[str]  # source names with page citations
+    email_status: dict  # email sending status
 
 
 search = SearchClient(
@@ -184,18 +185,25 @@ def ask(body: AskRequest):
     if not body.question or not body.question.strip():
         raise HTTPException(status_code=400, detail="Empty question")
     try:
-        hits = retrieve(body.question, top_k=body.top_k)
-        if not hits:
-            return AskResponse(
-                answer="I don't know based on the current index.", sources=[]
-            )
+        # Import the workflow
+        from .langgraph_workflow import rag_workflow
 
-        answer = synthesize_answer(body.question, hits)
+        # Run the LangGraph workflow
+        initial_state = {
+            "question": body.question,
+            "top_k": body.top_k,
+            "answer": "",
+            "sources": [],
+            "email_status": {},
+        }
 
-        # Aggregate sources with page citations
-        sources_with_pages = aggregate_sources_with_pages(hits)
+        result = rag_workflow.invoke(initial_state)
 
-        return AskResponse(answer=answer, sources=sources_with_pages)
+        return AskResponse(
+            answer=result["answer"],
+            sources=result["sources"],
+            email_status=result["email_status"],
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

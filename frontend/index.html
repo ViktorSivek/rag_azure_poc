@@ -471,7 +471,7 @@
         });
       }
 
-      function addMessage(role, text, sources) {
+      function addMessage(role, text, sources, emailStatus) {
         const row = document.createElement("div");
         row.className = `message ${role}`;
 
@@ -488,6 +488,16 @@
           meta.className = "meta";
           meta.textContent = "Sources: " + pretty.join(", ");
           chat.appendChild(meta);
+        }
+
+        if (role === "assistant" && emailStatus && emailStatus.status) {
+          const emailMeta = document.createElement("div");
+          emailMeta.className = "meta";
+          const statusIcon = emailStatus.status === "success" ? "✓" : "✗";
+          emailMeta.textContent = `${statusIcon} ${
+            emailStatus.message || emailStatus.status
+          }`;
+          chat.appendChild(emailMeta);
         }
 
         chat.scrollTop = chat.scrollHeight;
@@ -527,7 +537,8 @@
           addMessage(
             "assistant",
             data.answer || "(no answer)",
-            data.sources || []
+            data.sources || [],
+            data.email_status || {}
           );
         } catch (e) {
           addMessage("assistant", `Error: ${e.message}`);
