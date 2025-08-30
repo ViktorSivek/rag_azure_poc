@@ -1,6 +1,7 @@
 import os
 import re
-from typing import List, Dict
+import uuid
+from typing import List, Dict, Tuple
 
 from dotenv import load_dotenv
 import fitz
@@ -9,17 +10,6 @@ from openai import OpenAI
 from azure.core.credentials import AzureKeyCredential
 from azure.storage.blob import BlobServiceClient
 from azure.search.documents import SearchClient
-from azure.search.documents.indexes import SearchIndexClient
-from azure.search.documents.indexes.models import (
-    SearchIndex,
-    SimpleField,
-    SearchField,
-    SearchFieldDataType,
-    VectorSearch,
-    HnswAlgorithmConfiguration,
-    VectorSearchProfile,
-)
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # ---------------------------
 # Config
@@ -27,13 +17,13 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 load_dotenv()
 AZURE_SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_SERVICE_ENDPOINT")
 AZURE_SEARCH_KEY = os.getenv("AZURE_SEARCH_ADMIN_KEY")
-INDEX_NAME = os.getenv("AZURE_SEARCH_INDEX_NAME", "rag-poc-index")
+INDEX_NAME = os.getenv("AZURE_SEARCH_INDEX_NAME", "telco-rag-v2")
 
 BLOB_CONN_STR = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
 BLOB_CONTAINER = os.getenv("AZURE_STORAGE_CONTAINER", "documents")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # 1536 dims
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 
 if not all(
     [
@@ -56,172 +46,217 @@ container_client = blob_service_client.get_container_client(BLOB_CONTAINER)
 search_client = SearchClient(
     AZURE_SEARCH_ENDPOINT, INDEX_NAME, AzureKeyCredential(AZURE_SEARCH_KEY)
 )
-index_client = SearchIndexClient(
-    AZURE_SEARCH_ENDPOINT, AzureKeyCredential(AZURE_SEARCH_KEY)
-)
+
+# Document names mapping
+DOCUMENT_NAMES = {
+    "3GPP_TS_23.501.pdf": "3GPP TS 23.501 — System Architecture for the 5G System (5GS); Stage 2",
+    "BEREC_Guidelines.pdf": "BEREC Guidelines on the Implementation of the Open Internet Regulation (Net Neutrality)",
+    "ENISA_Technical_implementation_guidance.pdf": "ENISA Technical Implementation Guidance for the EU 5G Toolbox",
+    "ETSI_EN_300_328.pdf": "ETSI EN 300 328 — Wideband Data Transmission Systems (2.4 GHz)",
+    "Vseobecne_opravneni_VO-R-12.pdf": "Czech General Authorization VO‑R/12 — RLAN devices in the 5 GHz band",
+}
 
 
-# ---------------------------
-# Index
-# ---------------------------
-def ensure_index(index_name: str, dims: int = 1536):
-    try:
-        index_client.get_index(index_name)
-        print(f"Index '{index_name}' already exists.")
-        return
-    except Exception:
-        pass
-
-    fields = [
-        SimpleField(
-            name="id",
-            type=SearchFieldDataType.String,
-            key=True,
-            filterable=False,
-            sortable=False,
-            facetable=False,
-        ),
-        # Make content a SearchField so it’s really searchable
-        SearchField(name="content", type=SearchFieldDataType.String, searchable=True),
-        SimpleField(
-            name="source_document",
-            type=SearchFieldDataType.String,
-            filterable=True,
-            sortable=True,
-            facetable=True,
-        ),
-        SearchField(
-            name="content_vector",
-            type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
-            searchable=True,
-            vector_search_dimensions=dims,
-            vector_search_profile_name="hnsw-profile",
-        ),
-    ]
-    vector_search = VectorSearch(
-        algorithms=[HnswAlgorithmConfiguration(name="hnsw")],
-        profiles=[
-            VectorSearchProfile(
-                name="hnsw-profile", algorithm_configuration_name="hnsw"
-            )
-        ],
-    )
-    index = SearchIndex(name=index_name, fields=fields, vector_search=vector_search)
-    index_client.create_index(index)
-    print(f"Index '{index_name}' created (dims={dims}, HNSW, cosine).")
+def get_professional_name(filename: str) -> str:
+    """Get professional document name or fallback to filename"""
+    return DOCUMENT_NAMES.get(filename, filename)
 
 
-# ---------------------------
-# Helpers
-# ---------------------------
-def extract_pdf_text(pdf_bytes: bytes) -> str:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    parts: List[str] = [page.get_text("text") or "" for page in doc]
-    doc.close()
-    return "\n".join(parts)
-
-
-SAFE_KEY_RE = re.compile(r"[^A-Za-z0-9_\-=]")
-
-
-def make_key(source_document: str, i: int) -> str:
-    base = os.path.splitext(os.path.basename(source_document))[0]
-    base = SAFE_KEY_RE.sub("-", base).strip("-")
-    if not base:
-        base = "doc"
-    return f"{base}-{i}"
-
-
-def split_text(
-    text: str, source_document: str, chunk_size=1000, chunk_overlap=200
-) -> List[Dict]:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        length_function=len,
-        separators=["\n\n", "\n", " ", ""],
-    )
-    pieces = splitter.split_text(text)
-    out: List[Dict] = []
-    for i, t in enumerate(pieces):
-        t = t.strip()
-        if not t:
-            continue
-        out.append(
-            {
-                "id": make_key(source_document, i),
-                "content": t,
-                "source_document": source_document,
-            }
+def embed(text: str) -> List[float]:
+    """Generate embedding for text"""
+    return (
+        openai_client.embeddings.create(
+            model=EMBED_MODEL, input=[text.replace("\n", " ")]
         )
-    return out
+        .data[0]
+        .embedding
+    )
 
 
-def embed_batch(
-    texts: List[str], model: str = EMBED_MODEL, batch_size: int = 64
-) -> List[List[float]]:
-    embeddings: List[List[float]] = []
-    for i in range(0, len(texts), batch_size):
-        batch = [t.replace("\n", " ") for t in texts[i : i + batch_size]]
-        res = openai_client.embeddings.create(model=model, input=batch)
-        embeddings.extend([d.embedding for d in res.data])
-    return embeddings
+def smart_chunk_text(
+    text: str, max_chars: int = 1200, overlap_chars: int = 200
+) -> List[str]:
+    """
+    Enhanced chunking that respects paragraph boundaries and avoids mid-sentence splits
+    """
+    if len(text) <= max_chars:
+        return [text.strip()] if text.strip() else []
+
+    chunks = []
+    start = 0
+
+    while start < len(text):
+        end = start + max_chars
+
+        if end >= len(text):
+            chunk = text[start:].strip()
+            if chunk:
+                chunks.append(chunk)
+            break
+
+        # Try to find a good break point
+        break_point = end
+
+        # Look for paragraph break first (double newline)
+        para_break = text.rfind("\n\n", start, end)
+        if para_break > start + max_chars // 2:
+            break_point = para_break + 2
+        else:
+            # Look for sentence end
+            sentence_break = text.rfind(". ", start, end)
+            if sentence_break > start + max_chars // 2:
+                break_point = sentence_break + 2
+            else:
+                # Look for any newline
+                line_break = text.rfind("\n", start, end)
+                if line_break > start + max_chars // 2:
+                    break_point = line_break + 1
+
+        chunk = text[start:break_point].strip()
+        if chunk:
+            chunks.append(chunk)
+
+        # Move start position with overlap
+        start = max(break_point - overlap_chars, start + max_chars // 2)
+
+    return chunks
 
 
-def upload_in_batches(docs: List[Dict], batch_size: int = 800):
+def extract_pages_with_text(pdf_bytes: bytes) -> List[Tuple[int, str]]:
+    """
+    Extract text from each page of PDF, returning list of (page_number, text) tuples
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    pages = []
+
+    for page_num in range(doc.page_count):
+        page = doc.load_page(page_num)
+        text = page.get_text("text") or ""
+        pages.append((page_num + 1, text))  # 1-based page numbering
+
+    doc.close()
+    return pages
+
+
+def process_pdf_with_pages(pdf_bytes: bytes, source_document: str) -> List[Dict]:
+    """
+    Process PDF and create chunks with page information
+    """
+    pages = extract_pages_with_text(pdf_bytes)
+    total_pages = len(pages)
+
+    if not pages:
+        return []
+
+    all_chunks = []
+    global_chunk_index = 0
+
+    for page_num, page_text in pages:
+        if not page_text.strip():
+            continue
+
+        # Chunk the page text
+        page_chunks = smart_chunk_text(page_text.strip())
+
+        for local_chunk_index, chunk_text in enumerate(page_chunks):
+            chunk_doc = {
+                "id": str(uuid.uuid4()),
+                "source_document": source_document,
+                "page": page_num,
+                "chunk_index": global_chunk_index,
+                "total_pages": total_pages,
+                "content": chunk_text,
+            }
+            all_chunks.append(chunk_doc)
+            global_chunk_index += 1
+
+    return all_chunks
+
+
+def upload_in_batches(docs: List[Dict], batch_size: int = 100):
+    """Upload documents in batches"""
     for i in range(0, len(docs), batch_size):
         batch = docs[i : i + batch_size]
-        print(f"Uploading batch {i // batch_size + 1} ({len(batch)} docs)...")
-        result = search_client.upload_documents(documents=batch)
-        failed = [r for r in result if not r.succeeded]
-        if failed:
-            print(f"Failed {len(failed)} (showing first 5):")
-            for r in failed[:5]:
-                print(f"key={r.key} error={r.error_message}")
-        else:
-            print("OK")
+        print(f"  Uploading batch {i // batch_size + 1} ({len(batch)} chunks)...")
+
+        try:
+            result = search_client.upload_documents(documents=batch)
+            failed = [r for r in result if not r.succeeded]
+            if failed:
+                print(f"    Failed {len(failed)} chunks (showing first 3):")
+                for r in failed[:3]:
+                    print(f"      key={r.key} error={r.error_message}")
+            else:
+                print(f"    ✓ Successfully uploaded {len(batch)} chunks")
+        except Exception as e:
+            print(f"    ✗ Batch upload failed: {e}")
 
 
-# ---------------------------
-# Main
-# ---------------------------
-if __name__ == "__main__":
-    # If you switch to text-embedding-3-large, change dims to 3072 and re-ingest to a new index.
-    ensure_index(INDEX_NAME, dims=1536)
+def main():
+    """Main ingestion process"""
+    print(f"Starting ingestion to index: {INDEX_NAME}")
+    print(f"Using embedding model: {EMBED_MODEL}")
 
-    prepared: List[Dict] = []
+    all_documents = []
 
+    # Process each PDF in blob storage
     for blob in container_client.list_blobs():
-        name = blob.name
-        if not name.lower().endswith(".pdf"):
-            print(f"Skipping non-PDF: {name}")
+        filename = blob.name
+        if not filename.lower().endswith(".pdf"):
+            print(f"Skipping non-PDF: {filename}")
             continue
 
-        print(f"\nProcessing: {name}")
-        pdf_bytes = container_client.get_blob_client(name).download_blob().readall()
+        print(f"\nProcessing: {filename}")
 
-        text = extract_pdf_text(pdf_bytes)
-        if not text.strip():
-            print("  No text extracted (likely scanned). Skipping.")
-            continue
+        # Download PDF
+        pdf_bytes = container_client.get_blob_client(filename).download_blob().readall()
 
-        chunks = split_text(
-            text, source_document=name, chunk_size=1000, chunk_overlap=200
-        )
+        # Get document name
+        professional_name = get_professional_name(filename)
+        print(f"  Document name: {professional_name}")
+
+        # Process PDF
+        chunks = process_pdf_with_pages(pdf_bytes, professional_name)
+
         if not chunks:
-            print("  No chunks produced. Skipping.")
+            print("  ⚠ No chunks produced. Skipping.")
             continue
 
-        print(f"  Embedding {len(chunks)} chunks with {EMBED_MODEL}...")
-        vectors = embed_batch([c["content"] for c in chunks])
-        for c, v in zip(chunks, vectors):
-            c["content_vector"] = v
+        print(
+            f"  📄 Extracted {len(chunks)} chunks from {chunks[-1]['total_pages']} pages"
+        )
 
-        prepared.extend(chunks)
+        # Generate embeddings
+        print(f"  🔄 Generating embeddings...")
+        texts = [chunk["content"] for chunk in chunks]
 
-    if prepared:
-        print(f"\nPrepared {len(prepared)} docs. Uploading...")
-        upload_in_batches(prepared, batch_size=800)
-        print("\n--- Ingestion completed ---")
+        # Batch embedding generation
+        batch_size = 64
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i : i + batch_size]
+            embeddings = []
+
+            for text in batch_texts:
+                embedding = embed(text)
+                embeddings.append(embedding)
+
+            # Add embeddings to chunks
+            for j, embedding in enumerate(embeddings):
+                chunks[i + j]["content_vector"] = embedding
+
+        all_documents.extend(chunks)
+        print(f"  ✓ Prepared {len(chunks)} chunks with embeddings")
+
+    # Upload all documents
+    if all_documents:
+        print(f"\n📤 Uploading {len(all_documents)} total chunks to Azure Search...")
+        upload_in_batches(all_documents, batch_size=100)
+        print(
+            f"\n🎉 Ingestion completed! Indexed {len(all_documents)} chunks with page information."
+        )
     else:
-        print("Nothing to upload.")
+        print("\n⚠ No documents to upload.")
+
+
+if __name__ == "__main__":
+    main()

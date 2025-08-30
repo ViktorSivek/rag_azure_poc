@@ -419,7 +419,7 @@
       const q = el("q");
       const sendBtn = el("send");
 
-      // Map raw file names from API -> professional titles for display
+      // Map raw file names from API -> titles for display
       const SOURCE_LABELS = {
         "3GPP_TS_23.501":
           "3GPP TS 23.501 — System Architecture for the 5G System (5GS); Stage 2",
@@ -449,11 +449,11 @@
 
       // Suggestions (question-only; click to ask)
       const SUGGESTIONS = [
-        "In 5G core, what are the roles of AMF, SMF, and UPF?",
-        "Summarize the key net neutrality obligations defined by BEREC.",
-        "List recommended security measures for incident handling in telecom networks.",
+        "What are the two 5GS Registration Management states?",
+        "What is the total downlink capacity for DOCSIS spectrum 1 OFDM channel with 192 MHz?",
+        "What are the main categories of 5G security threats?",
         "What is the maximum mean e.i.r.p. and which clause states it?",
-        "What are the main operating conditions for RLAN devices in the 5 GHz band?",
+        "What is the maximum radiated power and spectral density for the 57-66 GHz frequency band?",
       ];
 
       function renderSuggestions() {
