@@ -1,5 +1,5 @@
 import os
-from typing import List, Optional
+from typing import List
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,7 +12,6 @@ from azure.search.documents import SearchClient
 from azure.search.documents.models import VectorizedQuery
 from openai import OpenAI
 
-# Load .env for local dev; in Azure, use Container App secrets/env instead
 load_dotenv()
 
 AZURE_SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_SERVICE_ENDPOINT")
@@ -38,58 +37,39 @@ if not (
     raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
 
-# Models
 class AskRequest(BaseModel):
     question: str
-    top_k: int = 6  # how many chunks to return to the client + LLM
-    knn: int = 50  # k_nearest_neighbors for vector search
-    hybrid: bool = True  # BM25 + vector
-    doc: Optional[str] = None  # restrict to a specific source_document
-
-
-class AskResponseSource(BaseModel):
-    doc: str
-    snippet: str
+    top_k: int = 6  # how many chunks to use
 
 
 class AskResponse(BaseModel):
     answer: str
-    sources: List[AskResponseSource]
+    sources: List[str]  # unique doc names only
 
 
-# Clients
-search_client = SearchClient(
+search = SearchClient(
     AZURE_SEARCH_ENDPOINT, AZURE_SEARCH_INDEX, AzureKeyCredential(AZURE_SEARCH_KEY)
 )
 oai = OpenAI(api_key=OPENAI_API_KEY)
 
 EMBED_MODEL = "text-embedding-3-small"
-GEN_MODEL = "gpt-4o-mini"  # pick a cost-effective model
+GEN_MODEL = "gpt-4o-mini"
 
 
 def embed(text: str):
     return oai.embeddings.create(model=EMBED_MODEL, input=[text]).data[0].embedding
 
 
-def odata_escape(value: str) -> str:
-    return value.replace("'", "''")
-
-
-def build_filter(doc: Optional[str]) -> Optional[str]:
-    if not doc:
-        return None
-    return f"source_document eq '{odata_escape(doc)}'"
-
-
-def retrieve(q: str, top_k: int, knn: int, hybrid: bool, doc: Optional[str]):
+def retrieve(q: str, top_k: int) -> List[dict]:
     vec = embed(q)
+    # fixed, sensible defaults; no UI controls
+    candidates = max(60, top_k * 5)
     vq = VectorizedQuery(
-        vector=vec, fields="content_vector", k_nearest_neighbors=max(knn, top_k)
+        vector=vec, fields="content_vector", k_nearest_neighbors=candidates
     )
-    results = search_client.search(
-        search_text=q if hybrid else "",  # empty string => vector-only
+    results = search.search(
+        search_text=q,  # hybrid on by default
         vector_queries=[vq],
-        filter=build_filter(doc),
         select=["id", "source_document", "content"],
         top=top_k,
     )
@@ -102,12 +82,10 @@ def retrieve(q: str, top_k: int, knn: int, hybrid: bool, doc: Optional[str]):
 
 
 def synthesize_answer(question: str, contexts: List[dict]) -> str:
-    # Assemble citations [1], [2], ...
-    blocks = []
-    for i, h in enumerate(contexts, 1):
-        blocks.append(f"[{i}] ({h['doc']}) {h['text']}")
-    sys = "You are a precise assistant. Answer using only the provided context. If the answer is not in the context, say you don't know. Cite sources like [1], [2]."
-    user = f"Question: {question}\n\nContext:\n" + "\n\n".join(blocks)
+    # no inline citations, just plain context
+    context = "\n---\n".join([(h["text"] or "") for h in contexts])
+    sys = "Answer only from the provided context. If unknown, say you don't know. Do not include citations."
+    user = f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer:"
     chat = oai.chat.completions.create(
         model=GEN_MODEL,
         messages=[
@@ -119,9 +97,8 @@ def synthesize_answer(question: str, contexts: List[dict]) -> str:
     return chat.choices[0].message.content
 
 
-app = FastAPI(title="RAG PoC API", version="1.0")
+app = FastAPI(title="RAG PoC API", version="1.2")
 
-# CORS (relax for PoC; tighten in prod)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -134,8 +111,7 @@ app.add_middleware(
 @app.get("/healthz")
 def healthz():
     try:
-        # quick ping
-        _ = search_client.get_document_count()
+        _ = search.get_document_count()
         return {"status": "ok"}
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -146,25 +122,17 @@ def ask(body: AskRequest):
     if not body.question or not body.question.strip():
         raise HTTPException(status_code=400, detail="Empty question")
     try:
-        hits = retrieve(
-            body.question,
-            top_k=body.top_k,
-            knn=body.knn,
-            hybrid=body.hybrid,
-            doc=body.doc,
-        )
+        hits = retrieve(body.question, top_k=body.top_k)
         if not hits:
             return AskResponse(
                 answer="I don't know based on the current index.", sources=[]
             )
         answer = synthesize_answer(body.question, hits)
-        sources = [
-            AskResponseSource(doc=h["doc"], snippet=h["text"][:300]) for h in hits
-        ]
-        return AskResponse(answer=answer, sources=sources)
+        # unique doc names, no counts
+        unique_sources = list(dict.fromkeys([h["doc"] for h in hits]))
+        return AskResponse(answer=answer, sources=unique_sources)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Serve the minimal frontend (place routes above; mount static last)
 app.mount("/", StaticFiles(directory="frontend", html=True), name="static")
