@@ -10,6 +10,12 @@ A Retrieval-Augmented Generation (RAG) application built with Azure AI Search, O
 - **Email Integration**: Automatic Gmail notifications with questions and answers
 - **Clean UI**: Modern web interface for asking questions and viewing responses
 
+## 🚀 Try Demo
+
+The application is deployed and running on Azure Container Apps:
+
+**[Try Live Demo →](https://rag-azure-poc.happycoast-b0528a38.germanywestcentral.azurecontainerapps.io)**
+
 ## Architecture
 
 ```
